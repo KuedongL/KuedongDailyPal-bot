@@ -11,6 +11,7 @@ log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
+DAILY_PUSH_SECRET = os.environ["DAILY_PUSH_SECRET"]
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "bot.db"))
 DEFAULT_LOCATION = "Luodong, Taiwan"
 TIMEZONE = "Asia/Taipei"
@@ -286,6 +287,12 @@ def run_daily_push():
             send_message(chat_id, build_daily_message(chat_id))
         except Exception as exc:
             log.warning("daily push failed for %s: %s", chat_id, exc)
+
+
+@app.route(f"/daily-push/{DAILY_PUSH_SECRET}", methods=["GET", "POST"])
+def trigger_daily_push():
+    run_daily_push()
+    return "ok"
 
 
 @app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])

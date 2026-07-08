@@ -1,0 +1,13 @@
+name: Daily push trigger
+
+on:
+  schedule:
+    - cron: "0 23 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call daily push endpoint
+        run: curl -fsS "${{ secrets.DAILY_PUSH_URL }}"
