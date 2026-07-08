@@ -1,7 +1,8 @@
 import logging
 import os
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, request
@@ -14,20 +15,12 @@ WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 DAILY_PUSH_SECRET = os.environ["DAILY_PUSH_SECRET"]
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "bot.db"))
 DEFAULT_LOCATION = "Luodong, Taiwan"
-TIMEZONE = "Asia/Taipei"
+TIMEZONE = ZoneInfo("Asia/Taipei")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-WEATHER_CODES = {
-    0: "晴朗", 1: "大致晴朗", 2: "多雲", 3: "陰天",
-    45: "起霧", 48: "霧淞",
-    51: "毛毛雨(小)", 53: "毛毛雨(中)", 55: "毛毛雨(大)",
-    61: "小雨", 63: "中雨", 65: "大雨",
-    66: "凍雨(小)", 67: "凍雨(大)",
-    71: "小雪", 73: "中雪", 75: "大雪", 77: "雪粒",
-    80: "陣雨(小)", 81: "陣雨(中)", 82: "陣雨(大)",
-    85: "陣雪(小)", 86: "陣雪(大)",
-    95: "雷雨", 96: "雷雨伴冰雹", 99: "強雷雨伴冰雹",
-}
+
+def today_taipei():
+    return datetime.now(TIMEZONE).date()
 
 app = Flask(__name__)
 
@@ -76,14 +69,14 @@ def set_location(chat_id: int, location: str):
 def parse_date(text: str) -> str | None:
     text = text.strip()
     if text in ("今天", "today"):
-        return date.today().isoformat()
+        return today_taipei().isoformat()
     if text in ("明天", "tomorrow"):
-        return (date.today() + timedelta(days=1)).isoformat()
+        return (today_taipei() + timedelta(days=1)).isoformat()
     try:
         return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
     except ValueError:
         try:
-            year = date.today().year
+            year = today_taipei().year
             return datetime.strptime(f"{year}-{text}", "%Y-%m-%d").date().isoformat()
         except ValueError:
             return None
@@ -128,40 +121,23 @@ def all_chat_ids() -> list[int]:
 
 
 def fetch_weather_text(location: str) -> str:
-    geo = requests.get(
-        "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": location, "count": 5, "language": "zh"},
-        timeout=10,
-    ).json()
-    results = geo.get("results")
-    if not results:
+    resp = requests.get(f"https://wttr.in/{location}", params={"format": "j1"}, timeout=10)
+    if not resp.ok:
         return f"找不到地點「{location}」,請確認名稱(建議用英文,如 Luodong, Taiwan)。"
 
-    place = next((r for r in results if r.get("country_code") == "TW"), results[0])
-    lat, lon = place["latitude"], place["longitude"]
-    name = place.get("name", location)
-
-    forecast = requests.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": lat,
-            "longitude": lon,
-            "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weathercode",
-            "timezone": TIMEZONE,
-            "forecast_days": 1,
-        },
-        timeout=10,
-    ).json()
-
-    daily = forecast["daily"]
-    code = daily["weathercode"][0]
-    desc = WEATHER_CODES.get(code, "未知天氣")
-    tmax = daily["temperature_2m_max"][0]
-    tmin = daily["temperature_2m_min"][0]
-    pop = daily["precipitation_probability_max"][0]
+    data = resp.json()
+    try:
+        area_name = data["nearest_area"][0]["areaName"][0]["value"]
+        today = data["weather"][0]
+        tmax = today["maxtempC"]
+        tmin = today["mintempC"]
+        pop = max(int(h["chanceofrain"]) for h in today["hourly"])
+        desc = data["current_condition"][0]["weatherDesc"][0]["value"]
+    except (KeyError, IndexError, ValueError):
+        return f"找不到地點「{location}」,請確認名稱(建議用英文,如 Luodong, Taiwan)。"
 
     return (
-        f"📍 {name} 今日天氣\n"
+        f"📍 {area_name} 今日天氣\n"
         f"{desc}\n"
         f"氣溫:{tmin}°C ~ {tmax}°C\n"
         f"降雨機率:{pop}%"
@@ -199,7 +175,7 @@ def cmd_list(chat_id: int, args: list[str]) -> str:
         if not todo_date:
             return "日期格式看不懂,請用 YYYY-MM-DD、今天或明天。"
     else:
-        todo_date = date.today().isoformat()
+        todo_date = today_taipei().isoformat()
 
     rows = list_todos(chat_id, todo_date)
     if not rows:
@@ -269,7 +245,7 @@ def build_daily_message(chat_id: int) -> str:
         log.warning("weather fetch failed for %s: %s", chat_id, exc)
         weather = "(天氣查詢失敗)"
 
-    today = date.today().isoformat()
+    today = today_taipei().isoformat()
     rows = list_todos(chat_id, today)
     if rows:
         todo_text = "\n".join(
