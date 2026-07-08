@@ -1,21 +1,20 @@
 import logging
 import os
 import sqlite3
-from datetime import date, datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from datetime import date, datetime, timedelta
 
 import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from flask import Flask, request
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-DB_PATH = os.environ.get("DB_PATH", "bot.db")
+WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
+DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "bot.db"))
 DEFAULT_LOCATION = "Luodong, Taiwan"
-DAILY_HOUR = int(os.environ.get("DAILY_HOUR", "7"))
 TIMEZONE = "Asia/Taipei"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 WEATHER_CODES = {
     0: "晴朗", 1: "大致晴朗", 2: "多雲", 3: "陰天",
@@ -28,6 +27,8 @@ WEATHER_CODES = {
     85: "陣雪(小)", 86: "陣雪(大)",
     95: "雷雨", 96: "雷雨伴冰雹", 99: "強雷雨伴冰雹",
 }
+
+app = Flask(__name__)
 
 
 def db():
@@ -118,6 +119,13 @@ def mark_done(chat_id: int, todo_id: int) -> bool:
     return changed
 
 
+def all_chat_ids() -> list[int]:
+    conn = db()
+    rows = [r[0] for r in conn.execute("SELECT chat_id FROM chats").fetchall()]
+    conn.close()
+    return rows
+
+
 def fetch_weather_text(location: str) -> str:
     geo = requests.get(
         "https://geocoding-api.open-meteo.com/v1/search",
@@ -159,9 +167,19 @@ def fetch_weather_text(location: str) -> str:
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_chat(update.effective_chat.id)
-    await update.message.reply_text(
+def send_message(chat_id: int, text: str):
+    resp = requests.post(
+        f"{TELEGRAM_API}/sendMessage",
+        json={"chat_id": chat_id, "text": text},
+        timeout=10,
+    )
+    if not resp.ok:
+        log.warning("sendMessage failed for %s: %s", chat_id, resp.text)
+
+
+def cmd_start(chat_id: int, args: list[str]) -> str:
+    ensure_chat(chat_id)
+    return (
         "嗨!我是每日小幫手 🐾\n"
         "每天 7:00 會傳今日天氣和代辦事項給你。\n\n"
         "指令:\n"
@@ -173,128 +191,134 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+def cmd_list(chat_id: int, args: list[str]) -> str:
     ensure_chat(chat_id)
-    if context.args:
-        todo_date = parse_date(" ".join(context.args))
+    if args:
+        todo_date = parse_date(" ".join(args))
         if not todo_date:
-            await update.message.reply_text("日期格式看不懂,請用 YYYY-MM-DD、今天或明天。")
-            return
+            return "日期格式看不懂,請用 YYYY-MM-DD、今天或明天。"
     else:
         todo_date = date.today().isoformat()
 
     rows = list_todos(chat_id, todo_date)
     if not rows:
-        await update.message.reply_text(f"{todo_date} 沒有代辦事項。")
-        return
+        return f"{todo_date} 沒有代辦事項。"
 
     lines = [f"📋 {todo_date} 代辦事項:"]
     for todo_id, content, done in rows:
         mark = "✅" if done else "◻️"
         lines.append(f"{mark} [{todo_id}] {content}")
-    await update.message.reply_text("\n".join(lines))
+    return "\n".join(lines)
 
 
-async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+def cmd_add(chat_id: int, args: list[str]) -> str:
     ensure_chat(chat_id)
-    if len(context.args) < 2:
-        await update.message.reply_text("用法:/add <日期> <內容>\n例如:/add 今天 買晚餐")
-        return
+    if len(args) < 2:
+        return "用法:/add <日期> <內容>\n例如:/add 今天 買晚餐"
 
-    todo_date = parse_date(context.args[0])
+    todo_date = parse_date(args[0])
     if not todo_date:
-        await update.message.reply_text("日期格式看不懂,請用 YYYY-MM-DD、今天或明天。")
-        return
+        return "日期格式看不懂,請用 YYYY-MM-DD、今天或明天。"
 
-    content = " ".join(context.args[1:])
+    content = " ".join(args[1:])
     add_todo(chat_id, todo_date, content)
-    await update.message.reply_text(f"已新增 {todo_date} 的代辦:{content}")
+    return f"已新增 {todo_date} 的代辦:{content}"
 
 
-async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("用法:/done <編號>(編號可從 /list 看到)")
-        return
+def cmd_done(chat_id: int, args: list[str]) -> str:
+    if not args or not args[0].isdigit():
+        return "用法:/done <編號>(編號可從 /list 看到)"
 
-    todo_id = int(context.args[0])
+    todo_id = int(args[0])
     if mark_done(chat_id, todo_id):
-        await update.message.reply_text(f"已將編號 {todo_id} 標記為完成 ✅")
-    else:
-        await update.message.reply_text("找不到這個編號,請先用 /list 確認。")
+        return f"已將編號 {todo_id} 標記為完成 ✅"
+    return "找不到這個編號,請先用 /list 確認。"
 
 
-async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+def cmd_weather(chat_id: int, args: list[str]) -> str:
     ensure_chat(chat_id)
-    location = " ".join(context.args) if context.args else get_location(chat_id)
-    await update.message.reply_text(fetch_weather_text(location))
+    location = " ".join(args) if args else get_location(chat_id)
+    return fetch_weather_text(location)
 
 
-async def cmd_setlocation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+def cmd_setlocation(chat_id: int, args: list[str]) -> str:
     ensure_chat(chat_id)
-    if not context.args:
-        await update.message.reply_text(
-            f"用法:/setlocation <地點>\n目前設定:{get_location(chat_id)}"
-        )
-        return
-    location = " ".join(context.args)
+    if not args:
+        return f"用法:/setlocation <地點>\n目前設定:{get_location(chat_id)}"
+    location = " ".join(args)
     set_location(chat_id, location)
-    await update.message.reply_text(f"已將預設地點設為:{location}")
+    return f"已將預設地點設為:{location}"
 
 
-async def daily_job(context: ContextTypes.DEFAULT_TYPE):
-    conn = db()
-    chat_ids = [r[0] for r in conn.execute("SELECT chat_id FROM chats").fetchall()]
-    conn.close()
+COMMANDS = {
+    "start": cmd_start,
+    "list": cmd_list,
+    "add": cmd_add,
+    "done": cmd_done,
+    "weather": cmd_weather,
+    "setlocation": cmd_setlocation,
+}
+
+
+def build_daily_message(chat_id: int) -> str:
+    location = get_location(chat_id)
+    try:
+        weather = fetch_weather_text(location)
+    except Exception as exc:
+        log.warning("weather fetch failed for %s: %s", chat_id, exc)
+        weather = "(天氣查詢失敗)"
 
     today = date.today().isoformat()
-    for chat_id in chat_ids:
-        location = get_location(chat_id)
+    rows = list_todos(chat_id, today)
+    if rows:
+        todo_text = "\n".join(
+            f"{'✅' if done else '◻️'} [{tid}] {content}" for tid, content, done in rows
+        )
+    else:
+        todo_text = "今天沒有安排的代辦事項。"
+
+    return f"☀️ 早安!今天的行程\n\n{weather}\n\n📋 代辦事項:\n{todo_text}"
+
+
+def run_daily_push():
+    for chat_id in all_chat_ids():
         try:
-            weather = fetch_weather_text(location)
+            send_message(chat_id, build_daily_message(chat_id))
         except Exception as exc:
-            log.warning("weather fetch failed for %s: %s", chat_id, exc)
-            weather = "(天氣查詢失敗)"
+            log.warning("daily push failed for %s: %s", chat_id, exc)
 
-        rows = list_todos(chat_id, today)
-        if rows:
-            todo_lines = [
-                f"{'✅' if done else '◻️'} [{tid}] {content}" for tid, content, done in rows
-            ]
-            todo_text = "\n".join(todo_lines)
-        else:
-            todo_text = "今天沒有安排的代辦事項。"
 
-        text = f"☀️ 早安!今天的行程\n\n{weather}\n\n📋 代辦事項:\n{todo_text}"
+@app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])
+def webhook():
+    update = request.get_json(force=True, silent=True) or {}
+    message = update.get("message") or update.get("edited_message")
+    if not message or "text" not in message:
+        return "ok"
+
+    chat_id = message["chat"]["id"]
+    text = message["text"].strip()
+    if not text.startswith("/"):
+        return "ok"
+
+    parts = text.split()
+    command = parts[0][1:].split("@")[0].lower()
+    args = parts[1:]
+
+    handler = COMMANDS.get(command)
+    if handler:
         try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
+            reply = handler(chat_id, args)
         except Exception as exc:
-            log.warning("send to %s failed: %s", chat_id, exc)
+            log.exception("command %s failed", command)
+            reply = "處理指令時發生錯誤,請稍後再試。"
+        send_message(chat_id, reply)
+    return "ok"
 
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("done", cmd_done))
-    app.add_handler(CommandHandler("weather", cmd_weather))
-    app.add_handler(CommandHandler("setlocation", cmd_setlocation))
-
-    app.job_queue.run_daily(
-        daily_job,
-        time=time(hour=DAILY_HOUR, minute=0, tzinfo=ZoneInfo(TIMEZONE)),
-        name="daily_weather_todo",
-    )
-
-    log.info("Bot starting (polling mode)")
-    app.run_polling(drop_pending_updates=True)
+@app.route("/")
+def index():
+    return "Bot is running."
 
 
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
